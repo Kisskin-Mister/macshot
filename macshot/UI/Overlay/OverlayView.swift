@@ -9511,6 +9511,13 @@ class OverlayView: NSView {
                     }
                     return
                 }
+                if isEditorMode,
+                   KeyboardShortcutMatcher.matches(event, character: "s", modifiers: [.command, .shift]) {
+                    if state == .selected {
+                        overlayDelegate?.overlayViewDidRequestSaveAs()
+                    }
+                    return
+                }
                 let commandModifiers = KeyboardShortcutMatcher.modifiers(in: event)
                 let isCommandCharacter = commandModifiers == .command
                     || commandModifiers == [.command, .shift]
