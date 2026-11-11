@@ -1,0 +1,118 @@
+name: Fork ad-hoc build + edit-in-place smoke test
+
+# Fork-only helper: builds an ad-hoc signed Release app from any ref, then
+# opens PNG/JPEG files with `open -a`, draws an arrow, presses Cmd+S and checks
+# the file was rewritten in place (same inode, new size/mtime, same format).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to build
+        required: true
+        default: feature/edit-in-place
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Select Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1); fi
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+
+      - name: Build Release (ad-hoc signed)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -scheme macshot \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+            | tee build.log | { grep -E "error:|\*\* BUILD" || true; }
+          exit ${PIPESTATUS[0]}
+
+      - name: Install and inspect
+        run: |
+          APP=build/Build/Products/Release/macshot.app
+          codesign -dv --entitlements - "$APP" 2>&1 | head -40
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes' "$APP/Contents/Info.plist"
+          sudo rm -rf /Applications/macshot.app
+          sudo cp -R "$APP" /Applications/macshot.app
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/macshot.app
+          ditto -c -k --keepParent /Applications/macshot.app macshot-adhoc.zip
+
+      - name: Smoke test (open -a, arrow, Cmd+S, stat)
+        continue-on-error: true
+        run: |
+          brew install cliclick >/dev/null 2>&1 || true
+          mkdir -p smoke && cd smoke
+          cat > gen.swift <<'SWIFT'
+          import CoreGraphics
+          import ImageIO
+          import Foundation
+          let space = CGColorSpace(name: CGColorSpace.sRGB)!
+          let ctx = CGContext(data: nil, width: 800, height: 500, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+          ctx.setFillColor(CGColor(red: 0.95, green: 0.95, blue: 0.9, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: 800, height: 500))
+          ctx.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)); ctx.fill(CGRect(x: 40, y: 40, width: 200, height: 120))
+          let img = ctx.makeImage()!
+          for (name, type) in [("test.png", "public.png"), ("test.jpg", "public.jpeg")] {
+              let d = CGImageDestinationCreateWithURL(URL(fileURLWithPath: CommandLine.arguments[1] + "/" + name) as CFURL, type as CFString, 1, nil)!
+              CGImageDestinationAddImage(d, img, nil); CGImageDestinationFinalize(d)
+          }
+          SWIFT
+          swift gen.swift "$PWD"
+          for f in test.png test.jpg; do
+            echo "===== $f ====="
+            P="$PWD/$f"
+            echo "before: $(stat -f 'inode=%i size=%z mtime=%m' "$P")  $(file -b "$P")"
+            BEFORE_INODE=$(stat -f %i "$P"); BEFORE_SUM=$(shasum "$P" | cut -d' ' -f1)
+            open -a /Applications/macshot.app "$P"
+            sleep 8
+            osascript -e 'tell application "System Events" to get {name, position, size} of every window of process "macshot"' || true
+            read X Y W H < <(osascript -e 'tell application "System Events" to tell process "macshot"' \
+              -e "set w to first window whose name is \"$f\"" \
+              -e 'set {px, py} to position of w' -e 'set {sx, sy} to size of w' \
+              -e 'return (px as text) & " " & (py as text) & " " & (sx as text) & " " & (sy as text)' -e 'end tell' || echo "0 0 0 0")
+            echo "window: $X $Y $W $H"
+            if [ "$W" != "0" ]; then
+              CX=$((X + W / 2)); CY=$((Y + H / 2))
+              cliclick "m:$((CX-150)),$((CY+60))" "dd:$((CX-150)),$((CY+60))" "m:$((CX-50)),$((CY+20))" "m:$((CX+80)),$((CY-40))" "du:$((CX+80)),$((CY-40))" || true
+              sleep 1
+              screencapture -x "edited-$f.png" || true
+              osascript -e 'tell application "System Events" to keystroke "s" using command down' || true
+              sleep 4
+            fi
+            echo "after:  $(stat -f 'inode=%i size=%z mtime=%m' "$P")  $(file -b "$P")"
+            AFTER_INODE=$(stat -f %i "$P"); AFTER_SUM=$(shasum "$P" | cut -d' ' -f1)
+            [ "$BEFORE_INODE" = "$AFTER_INODE" ] && echo "RESULT $f: same inode" || echo "RESULT $f: INODE CHANGED"
+            [ "$BEFORE_SUM" != "$AFTER_SUM" ] && echo "RESULT $f: content changed" || echo "RESULT $f: CONTENT UNCHANGED"
+            osascript -e 'tell application "System Events" to keystroke "w" using command down' || true
+            sleep 2
+            # Reopen: the arrow must be part of the pixels now.
+            open -a /Applications/macshot.app "$P"; sleep 5
+            screencapture -x "reopened-$f.png" || true
+            osascript -e 'tell application "System Events" to keystroke "w" using command down' || true
+            sleep 2
+            cp "$P" "saved-$f"
+          done
+          osascript -e 'quit app "macshot"' || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macshot-adhoc
+          path: |
+            macshot-adhoc.zip
+            smoke/*.png
+            smoke/*.jpg
+            build.log
+          retention-days: 14
