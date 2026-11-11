@@ -45,6 +45,13 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
     /// When true, force beautify off on open (image already has beautify baked in).
     private var disableBeautifyOnOpen: Bool = false
     private var initialEditState: CaptureEditState?
+    /// The image file this editor was opened from, when it can be written back
+    /// in its own format. Cmd+S then overwrites that file instead of exporting.
+    private var sourceFile: SourceImageFile?
+    private var isSavingSourceFile = false
+    /// A Cmd+S that arrived while a write was in flight; replayed with the
+    /// editor's state at that time so writes never land out of order.
+    private var pendingSourceFileSaveCloses: Bool?
 
     /// Open an editor window with the given image (typically from captureSelectedRegion).
     /// When `disableBeautify` is true, beautify starts off regardless of UserDefaults
@@ -57,9 +64,10 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
     /// here: writing `view.currentTool = .arrow` triggers the didSet that
     /// persists "arrow" globally, wiping the user's last-tool memory across
     /// the whole app.
-    static func open(image: NSImage, tool: AnnotationTool? = nil, color: NSColor? = nil, strokeWidth: CGFloat? = nil, annotations: [Annotation] = [], historyEntryID: String? = nil, fromCapture: Bool = false, disableBeautify: Bool = false, editState: CaptureEditState? = nil) {
+    static func open(image: NSImage, tool: AnnotationTool? = nil, color: NSColor? = nil, strokeWidth: CGFloat? = nil, annotations: [Annotation] = [], historyEntryID: String? = nil, fromCapture: Bool = false, disableBeautify: Bool = false, editState: CaptureEditState? = nil, sourceFile: SourceImageFile? = nil) {
         let controller = DetachedEditorWindowController()
         controller.historyEntryID = historyEntryID
+        controller.sourceFile = sourceFile
         controller.disableBeautifyOnOpen = disableBeautify
         controller.initialEditState = editState
         // Only warn about unsaved capture if the image came from a live capture (not a file on disk)
@@ -97,9 +105,15 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
         )
         // Timestamp suffix so multiple editor windows are distinguishable
         // in the Dock menu, Window menu, and Mission Control.
-        let dateFmt = DateFormatter()
-        dateFmt.dateFormat = "HH:mm:ss"
-        win.title = "macshot Editor · \(dateFmt.string(from: Date()))"
+        if let sourceFile {
+            // Document-style window: file name, proxy icon, edited dot.
+            win.title = sourceFile.displayName
+            win.representedURL = sourceFile.url
+        } else {
+            let dateFmt = DateFormatter()
+            dateFmt.dateFormat = "HH:mm:ss"
+            win.title = "macshot Editor · \(dateFmt.string(from: Date()))"
+        }
         win.minSize = NSSize(width: minW, height: minH)
         win.maxSize = NSSize(width: screenFrame.width, height: screenFrame.height)
         win.isReleasedWhenClosed = false
@@ -238,6 +252,7 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
 
         self.window = win
         self.overlayView = view
+        refreshDoneButtonVisibility()
     }
 
     /// Record the current state as the "clean" baseline against which a close
@@ -258,10 +273,14 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
     /// Show the "Done" (commit-to-history) button only when there are unsaved
     /// edits — like the overlay → editor flow, which has no Done until you draw.
     private func refreshDoneButtonVisibility() {
-        if isDirty() {
+        let dirty = isDirty()
+        if dirty {
             topBar?.showDoneButton()
         } else {
             topBar?.hideDoneButton()
+        }
+        if sourceFile != nil {
+            window?.isDocumentEdited = dirty
         }
     }
 
@@ -284,6 +303,11 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
         let hasChanges = isDirty()
 
         guard hasChanges else { return true }
+
+        if sourceFile != nil {
+            confirmCloseWithUnsavedSourceFile(sender, view: view)
+            return false
+        }
 
         let alert = NSAlert()
         alert.messageText = L("Save changes?")
@@ -362,8 +386,12 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
                 && self.overlayView?.captureEditState() == save.editState
             if success {
                 self.screenshotNeverOutput = false
-                self.lastSavedUndoState = save.undoState
-                self.lastSavedEditState = save.editState
+                // A file-backed editor is clean only when its source file holds
+                // the edits; a history copy alone doesn't count.
+                if self.sourceFile == nil {
+                    self.lastSavedUndoState = save.undoState
+                    self.lastSavedEditState = save.editState
+                }
                 self.refreshDoneButtonVisibility()
                 if let id = self.historyEntryID {
                     (NSApp.delegate as? AppDelegate)?.refreshThumbnail(for: id, image: finalImage, annotationData: data)
@@ -393,6 +421,11 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
 
     /// Commit current editor state back to the history entry, then close.
     private func commitToHistory() {
+        if sourceFile != nil {
+            // "Done" on an opened file means: write it back and close.
+            saveToSourceFile(closeOnSuccess: true)
+            return
+        }
         guard let save = captureHistorySave() else { return }
         saveToHistory(save) { [weak self] success in
             guard success, let self, !self.isDirty() else { return }
@@ -421,6 +454,100 @@ class DetachedEditorWindowController: NSObject, NSWindowDelegate {
             annotations: annotations,
             editState: editState.hasPostProcessing ? editState : nil
         )
+    }
+
+    // MARK: - Source file (edit in place)
+
+    /// Writes the current image (annotations, crop, effects) back into the file
+    /// the editor was opened from, in that file's format. No panels.
+    private func saveToSourceFile(closeOnSuccess: Bool = false) {
+        guard let file = sourceFile else { return }
+        if isSavingSourceFile {
+            pendingSourceFileSaveCloses = closeOnSuccess || (pendingSourceFileSaveCloses ?? false)
+            return
+        }
+        guard let save = captureHistorySave() else { return }
+        let pixels: HistoryImageSnapshot.Image
+        do {
+            pixels = try HistoryImageSnapshot.Image(save.image)
+        } catch {
+            presentSourceFileSaveError(error)
+            return
+        }
+        isSavingSourceFile = true
+        MediaExportCoordinator.shared.start(title: file.displayName, status: L("Saving..."), operation: { cancellation, _ in
+            _ = try await MediaExportIO.perform {
+                try autoreleasepool {
+                    let data = try file.encode(pixels.pixels)
+                    try cancellation.beginPublication()
+                    return try file.write(data)
+                }
+            }
+        }, completion: { [weak self] result in
+            guard let self else { return }
+            self.isSavingSourceFile = false
+            switch result {
+            case .success:
+                self.screenshotNeverOutput = false
+                self.lastSavedUndoState = save.undoState
+                self.lastSavedEditState = save.editState
+                self.refreshDoneButtonVisibility()
+                if let pendingCloses = self.pendingSourceFileSaveCloses {
+                    self.pendingSourceFileSaveCloses = nil
+                    self.saveToSourceFile(closeOnSuccess: pendingCloses)
+                } else if closeOnSuccess, !self.isDirty() {
+                    self.window?.close()
+                }
+            case .failure(let error):
+                self.pendingSourceFileSaveCloses = nil
+                if !(error is CancellationError) {
+                    self.presentSourceFileSaveError(error)
+                }
+            }
+        })
+    }
+
+    /// Read-only file, revoked access, full disk…: explain and offer Save As.
+    private func presentSourceFileSaveError(_ error: Error) {
+        guard let window else {
+            (NSApp.delegate as? AppDelegate)?.showFailureToast(
+                String(format: L("Could not save the screenshot: %@"), error.localizedDescription))
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = L("Save failed")
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: L("Save As…"))
+        alert.addButton(withTitle: L("Cancel"))
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.overlayViewDidRequestSaveAs()
+        }
+    }
+
+    /// Standard document close prompt: Save / Don't Save / Cancel.
+    private func confirmCloseWithUnsavedSourceFile(_ sender: NSWindow, view: OverlayView) {
+        let alert = NSAlert()
+        alert.messageText = L("Save changes?")
+        alert.informativeText = sourceFile?.displayName ?? ""
+        alert.addButton(withTitle: L("Save"))
+        alert.addButton(withTitle: L("Discard"))
+        alert.addButton(withTitle: L("Cancel"))
+        alert.alertStyle = .warning
+        alert.beginSheetModal(for: sender) { [weak self, weak sender] response in
+            guard let self else { return }
+            switch response {
+            case .alertFirstButtonReturn:
+                self.saveToSourceFile(closeOnSuccess: true)
+            case .alertSecondButtonReturn:
+                self.screenshotNeverOutput = false
+                self.captureCleanBaseline(view)
+                sender?.close()
+            default:
+                break
+            }
+        }
     }
 
     /// Apply image effects and beautify to the captured image.
@@ -458,6 +585,10 @@ extension DetachedEditorWindowController: OverlayViewDelegate {
     }
 
     func overlayViewDidRequestSave() {
+        if sourceFile != nil {
+            saveToSourceFile()
+            return
+        }
         switch SaveActionPreference.current {
         case .saveToFolder:
             overlayViewDidRequestFileSave()
@@ -468,7 +599,9 @@ extension DetachedEditorWindowController: OverlayViewDelegate {
 
     func overlayViewDidRequestSaveAs() {
         guard let save = captureHistorySave() else { return }
-        ImageSaveService.showSavePanel(for: save.image, sheetWindow: window) { [weak self] success in
+        // Save As exports a copy; the editor stays bound to its source file.
+        let suggestedName = sourceFile?.url.deletingPathExtension().lastPathComponent
+        ImageSaveService.showSavePanel(for: save.image, suggestedFilename: suggestedName, sheetWindow: window) { [weak self] success in
             if success {
                 self?.playCopySound()
                 self?.autoSaveToHistoryIfNeeded(save)

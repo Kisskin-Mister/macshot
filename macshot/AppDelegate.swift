@@ -2352,7 +2352,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         } else {
             return
         }
-        DetachedEditorWindowController.open(image: image)
+        // PNG/JPEG/HEIC files open as documents: Cmd+S writes them back in
+        // place (e.g. a Confluence attachment opened by Atlassian Companion).
+        DetachedEditorWindowController.open(image: image, sourceFile: SourceImageFile(url: url))
     }
 
     /// Open a history entry in the editor by its id, restoring editable annotations when

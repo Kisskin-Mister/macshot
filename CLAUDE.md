@@ -218,6 +218,7 @@ translateOverlay, crop, colorSampler
 - Container view holds scroll view + EditorTopBarView
 - `chromeParentView` set BEFORE `applySelection` so toolbars go in container (not document view)
 - Static `activeControllers[]` array keeps instances alive; switches activation policy to `.regular` when open, `.accessory` when all closed
+- **Opened files are documents.** A PNG/JPEG/HEIC opened via Finder "Open With", the Dock or `open -a` carries a `SourceImageFile`: the window shows the file name, proxy icon and `isDocumentEdited`; Cmd+S (and Done) write the flattened image back into that file in its own format with no panel; Cmd+Shift+S is Save As (a copy — the editor stays bound to the source). The write goes into the existing file (same inode, `FileHandle` + truncate) because external tools such as Atlassian Companion watch it; only a file that can't be opened for writing falls back to an atomic replace, and a read-only file is never replaced. History copies don't mark a file-backed editor clean.
 
 ### Protocols
 
